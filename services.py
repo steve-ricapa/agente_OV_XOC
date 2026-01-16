@@ -1,5 +1,6 @@
 import json
 import os
+import requests
 import time
 import traceback
 from typing import Any, Optional
@@ -184,17 +185,20 @@ def emit_payload(
     output_mode: str,
     url: str,
     api_key: str,
-    payload: dict[str, Any],
+    payload: dict,
     timeout: int = 15,
     require_https: bool = True
 ) -> bool:
     step = "services.emit_payload"
     mode = (output_mode or "console").strip().lower()
 
+    tls_verify_env = os.getenv("BACKEND_TLS_VERIFY", "true").strip().lower()
+    tls_verify = tls_verify_env in {"1", "true", "yes", "y", "on"}
+
     try:
         if mode == "console":
             print("\n" + "=" * 90)
-            print(f"[{_now()}] TXDXAI INGEST (console-only)")
+            print("TXDXAI INGEST (console-only)")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             print("=" * 90 + "\n")
             return True
@@ -209,26 +213,35 @@ def emit_payload(
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        # 🔻 Ignorar warnings cuando verify=False (modo laboratorio)
+        if not tls_verify:
+            try:
+                import urllib3  # type: ignore
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+
+        r = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            verify=tls_verify,  # ✅ aquí se ignora el certificado
+        )
 
         if 200 <= r.status_code < 300:
-            print(f"[{_now()}] OK backend ({r.status_code})")
+            print(f"OK backend ({r.status_code})")
             return True
 
         snippet = (r.text or "")[:300]
         raise RuntimeError(f"Backend rechazó: HTTP {r.status_code}. Respuesta: {snippet}")
 
     except requests.exceptions.SSLError as e:
-        print(format_exception(step, e, {"url": url, "hint": "TLS/certificados"}))
-        return False
-    except requests.exceptions.ConnectionError as e:
-        print(format_exception(step, e, {"url": url, "hint": "DNS/ruta/firewall"}))
-        return False
-    except requests.exceptions.Timeout as e:
-        print(format_exception(step, e, {"url": url, "timeout": timeout, "hint": "Backend lento/caído"}))
+        # ✅ no crashea
+        print(format_exception(step, e, {"url": url, "tls_verify": tls_verify, "accion": "se ignora SSL y se continúa"}))
         return False
     except requests.exceptions.RequestException as e:
-        print(format_exception(step, e, {"url": url, "hint": "Error HTTP genérico"}))
+        print(format_exception(step, e, {"url": url, "tls_verify": tls_verify}))
         return False
     except Exception as e:
         print(format_exception(step, e, {"mode": mode, "url": url}))
