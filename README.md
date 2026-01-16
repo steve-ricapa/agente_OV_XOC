@@ -1,4 +1,5 @@
-# AGENTE OPENVAS – LABORATORIO}
+# AGENTE OPENVAS – LABORATORIO
+
 ## 1. Propósito y alcance
 
 Este proyecto implementa un **agente recolector** pensado para **entornos de laboratorio**, cuyo propósito es simular/automatizar el flujo:
@@ -9,6 +10,7 @@ Este proyecto implementa un **agente recolector** pensado para **entornos de lab
 4) **Emitir** el payload (en backend o en consola, dependiendo del modo)
 
 Este tipo de agente sirve para:
+
 - Probar **integración** con backends (ingest)
 - Entrenar equipos en **observabilidad** de pipelines (polling + estado)
 - Depurar parsing de reportes OpenVAS/GVM
@@ -18,6 +20,7 @@ Este tipo de agente sirve para:
 ## 2. Qué hace y qué NO hace
 
 ### 2.1 Sí hace
+
 - Lee configuración desde variables de entorno (`.env` o `export ...`)
 - Corre en bucle con intervalo fijo (`POLL_SECONDS`)
 - Obtiene XML de reportes (simulado o real, según tu implementación)
@@ -26,6 +29,7 @@ Este tipo de agente sirve para:
 - Emite un payload (backend o consola)
 
 ### 2.2 NO hace
+
 - ❌ No lanza escaneos
 - ❌ No ejecuta pruebas de explotación
 - ❌ No hace descubrimiento activo (más allá de consumir datos ya existentes)
@@ -100,15 +104,18 @@ A nivel operacional, el ciclo del agente suele verse así:
    - En modo backend: se envía por HTTP (si aplica)
 
 10. **Actualización de estado**
-   - Si la emisión fue exitosa:
-     - se agrega el ID a `state["sent"]`
-     - se guarda `state.json`
 
-11. **Sleep**
-   - `time.sleep(POLL_SECONDS)`
+- Si la emisión fue exitosa:
+  - se agrega el ID a `state["sent"]`
+  - se guarda `state.json`
 
-12. **Siguiente ciclo**
-   - Vuelve al paso 4
+1. **Sleep**
+
+- `time.sleep(POLL_SECONDS)`
+
+1. **Siguiente ciclo**
+
+- Vuelve al paso 4
 
 ---
 
@@ -165,6 +172,7 @@ El agente construye un payload típico que incluye:
   - nombre del target, host, scanner, etc. (si el XML lo provee)
 
 ### Ejemplo de payload (orientativo)
+
 ```json
 {
   "company_id": 1,
@@ -196,10 +204,13 @@ La lógica típica de laboratorio mapea un valor numérico (ej. CVSS) a 4 nivele
 | Low      | `< 4.0`  |
 
 ### ¿De dónde sale el valor?
+
 En reportes OpenVAS/GVM suele aparecer un campo de severidad por resultado, por ejemplo:
+
 - `result/severity`
 
 El agente recorre cada `<result>` y:
+
 - intenta leer `severity`
 - convierte a float
 - incrementa el contador del bucket correspondiente
@@ -213,10 +224,12 @@ El agente recorre cada `<result>` y:
 `state.json` es la “memoria” del agente para evitar reenvíos.
 
 ### 8.1 ¿Por qué existe?
+
 Cuando el agente corre por polling, en cada ciclo podría “ver” los mismos reportes.  
 Sin una memoria, enviaría duplicados infinitamente.
 
 ### 8.2 Formato esperado
+
 ```json
 {
   "sent": [
@@ -227,6 +240,7 @@ Sin una memoria, enviaría duplicados infinitamente.
 ```
 
 ### 8.3 Reglas típicas
+
 - Si `state.json` no existe → se crea implícitamente al guardar, y se parte desde `{"sent":[]}`
 - Un reporte se marca como “sent” **solo si** la emisión fue exitosa
 - Si borras `state.json` → el agente “olvida” todo y volverá a procesar como si fuera primera ejecución
@@ -239,6 +253,7 @@ Sin una memoria, enviaría duplicados infinitamente.
 > En esta documentación se describen variables comunes.
 
 ### 9.1 Backend (si existiera)
+
 | Variable | Tipo | Ejemplo | Uso |
 |---|---|---|---|
 | `TXDXAI_INGEST_URL` | string | `https://host/ingest` | Endpoint destino |
@@ -248,6 +263,7 @@ Sin una memoria, enviaría duplicados infinitamente.
 > En modo simplificado, el URL puede ser informativo (`console://stdout`) y la API key puede ir vacía.
 
 ### 9.2 Control del agente
+
 | Variable | Tipo | Ejemplo | Significado |
 |---|---:|---|---|
 | `POLL_SECONDS` | int | `60` | Tiempo de espera entre ciclos |
@@ -256,6 +272,7 @@ Sin una memoria, enviaría duplicados infinitamente.
 | `META_MAX_KB` | int | `64` | Límite de tamaño (si se usa) |
 
 ### 9.3 OpenVAS / GVM (conexión)
+
 | Variable | Tipo | Ejemplo |
 |---|---|---|
 | `GVM_HOST` | string | `127.0.0.1` |
@@ -269,6 +286,7 @@ Sin una memoria, enviaría duplicados infinitamente.
 ## 10. Modos de ejecución
 
 ### 10.1 Modo “simplificado” (console-only)
+
 - La “emisión” es imprimir el payload en stdout
 - No depende de backend
 - Ideal para:
@@ -277,6 +295,7 @@ Sin una memoria, enviaría duplicados infinitamente.
   - Ver payloads en vivo
 
 ### 10.2 Modo “backend” (si lo reactivas)
+
 - La “emisión” es un POST HTTP con JSON
 - Requiere:
   - URL válida
@@ -292,11 +311,13 @@ Sin una memoria, enviaría duplicados infinitamente.
 > Asume que ya cuentas con Python y el entorno preparado.
 
 ### 11.1 Entrar al directorio del proyecto
+
 ```bash
 cd agente_OV_XOC
 ```
 
 ### 11.2 Definir variables mínimas de ejecución (ejemplo)
+>
 > Si ya usas `.env`, puedes omitir y pasar al punto 11.3.
 
 ```bash
@@ -318,18 +339,23 @@ export COLLECTOR="openvas"
 ```
 
 ### 11.3 Ejecutar el agente
+
 ```bash
 python3 main.py
 ```
 
 ### 11.4 Detener el agente
+
 En cualquier momento:
+
 ```text
 Ctrl + C
 ```
 
 ### 11.5 Reiniciar desde cero (opcional)
+
 Si quieres que el agente reprocesse como “primera vez”:
+
 ```bash
 rm -f state.json
 ```
@@ -339,11 +365,13 @@ rm -f state.json
 ## 12. Verificación rápida y ejemplos de salida
 
 ### 12.1 Señales de ejecución correcta
+
 - Se imprime un mensaje de arranque
 - Empiezas a ver “ciclos” repetidos
 - Cada ciclo ocurre aproximadamente cada `POLL_SECONDS`
 
 ### 12.2 Ejemplo de salida (modo simplificado)
+>
 > Lo importante es que veas el JSON completo en consola.
 
 ```json
@@ -361,6 +389,7 @@ rm -f state.json
 ```
 
 ### 12.3 Confirmar deduplicación
+
 - En el primer ciclo se imprime el reporte
 - En ciclos siguientes, si el `report_id` ya está en `state.json`, no debería reimprimirse
 
@@ -369,12 +398,14 @@ rm -f state.json
 ## 13. Manejo de errores y comportamiento ante fallos
 
 En laboratorio, el patrón típico es:
+
 - Si algo falla (conexión, parsing, timeout):
   - se registra el error en consola
   - el loop continúa
   - el agente vuelve a intentar en el siguiente ciclo
 
 Esto permite demostrar:
+
 - robustez básica ante fallos
 - recuperación automática por polling
 
@@ -394,21 +425,26 @@ Esto permite demostrar:
 ## 15. Troubleshooting: problemas comunes
 
 ### 15.1 “ModuleNotFoundError”
+
 - Asegúrate de ejecutar desde la raíz del proyecto:
+
 ```bash
 cd agente_OV_XOC
 python3 main.py
 ```
 
 ### 15.2 No imprime nada / se queda “quieto”
+
 - Verifica `POLL_SECONDS` (si es grande, el agente esperará)
 - Revisa que el origen (GVM) esté disponible si el agente intenta consultarlo
 
 ### 15.3 Repite lo mismo muchas veces
+
 - Verifica si `STATE_PATH` apunta al archivo correcto
 - Confirma que `state.json` se está escribiendo y contiene `sent`
 
 ### 15.4 Quieres reprocesar todo desde cero
+
 ```bash
 rm -f state.json
 python3 main.py
@@ -422,6 +458,7 @@ python3 main.py
 > (Sin pasos de instalación en esta sección.)
 
 Ejecutar en la raíz del proyecto:
+
 ```bash
 pytest
 ```
@@ -431,6 +468,7 @@ pytest
 ## 17. Seguridad (solo laboratorio)
 
 ⚠️ Este proyecto puede usar:
+
 - credenciales en texto plano
 - TLS opcional
 - tokens simples

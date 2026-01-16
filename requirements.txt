@@ -1,10 +1,8 @@
 python-dotenv==1.0.1
-requests==2.31.0
-python-gvm==23.4.0
-pytest==8.0.0
-virtualenv==20.24.3
-Flask==2.3.3
-gunicorn==20.1.0
-flask-cors==3.0.10
-sqlalchemy==2.0.20
-psycopg2-binary==2.9.6
+requests==2.32.3
+
+# Provee el módulo `gvm`
+python-gvm==26.9.0
+
+# XML robusto/seguro
+defusedxml==0.7.1
