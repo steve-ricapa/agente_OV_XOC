@@ -75,3 +75,6 @@ while True:
 
     print(f"Esperando {POLL_SECONDS}s")
     time.sleep(POLL_SECONDS)
+
+import os
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"

@@ -6,9 +6,9 @@ load_dotenv()
 # =========================
 # Backend
 # =========================
-TXDXAI_INGEST_URL = os.getenv("TXDXAI_INGEST_URL")
-TXDXAI_COMPANY_ID = int(os.getenv("TXDXAI_COMPANY_ID"))
-TXDXAI_API_KEY = os.getenv("TXDXAI_API_KEY")
+TXDXAI_INGEST_URL = os.getenv("TXDXAI_INGEST_URL", "console://stdout")
+TXDXAI_COMPANY_ID = int(os.getenv("TXDXAI_COMPANY_ID", "0"))
+TXDXAI_API_KEY = os.getenv("TXDXAI_API_KEY", "")
 
 # =========================
 # Agent config

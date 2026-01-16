@@ -1,7 +1,7 @@
 import os
 import json
+import time
 import xml.etree.ElementTree as ET
-import requests
 
 # =========================
 # Estado
@@ -53,27 +53,29 @@ def extract_severities(xml_text):
 
 
 # =========================
-# Backend
+# Backend (console-only)
 # =========================
 
 def send_to_backend(url, payload):
-    try:
-        r = requests.post(url, json=payload, timeout=15)
+    """Modo consola: no envía nada por red.
 
-        if 200 <= r.status_code < 300:
-            print("OK -> enviado al backend")
-            return True
+    `url` se mantiene solo para compatibilidad con el flujo actual de `main.py`.
+    """
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    print("\n" + "=" * 90)
+    print(f"[{ts}] TXDXAI INGEST (console-only) -> {url}")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print("=" * 90 + "\n")
+    return True
 
-        print(
-            f"ERROR HTTP {r.status_code} "
-            f"-> backend rechazó la petición"
-        )
-        return False
 
-    except requests.exceptions.ConnectionError:
-        print("ERROR -> no se pudo conectar al backend")
-        return False
-
-    except requests.exceptions.Timeout:
-        print("ERROR -> timeout del backend")
-        return False
+def map_status(status: str) -> str:
+    """Normaliza estados típicos (soporta los tests incluidos)."""
+    s = (status or "").strip().lower()
+    if s in {"running", "in progress", "in_progress"}:
+        return "running"
+    if s in {"pending", "queued", "wait", "waiting"}:
+        return "pending"
+    if s in {"completed", "done", "finished", "success"}:
+        return "completed"
+    return s
