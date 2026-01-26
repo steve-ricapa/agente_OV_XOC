@@ -1,6 +1,8 @@
 import os
 from dotenv import load_dotenv
 
+
+
 load_dotenv()
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -42,6 +44,7 @@ GVM_HOST = _env("GVM_HOST", "127.0.0.1") or "127.0.0.1"
 GVM_PORT = _env_int("GVM_PORT", 9390)
 GVM_USERNAME = _env("GVM_USERNAME", _env("GVM_USER", "admin")) or "admin"
 GVM_PASSWORD = _env("GVM_PASSWORD", _env("GVM_PASS", "")) or ""
+GVM_SOCKET = _env("GVM_SOCKET", "") or ""
 
 DEBUG = _env_bool("DEBUG", False)
 MAX_ERROR_REPEAT = _env_int("MAX_ERROR_REPEAT", 3)

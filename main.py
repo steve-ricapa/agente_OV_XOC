@@ -2,14 +2,13 @@ import os
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 import time
-import traceback
 import socket
 import xml.etree.ElementTree as ET
 
 from config import (
     OUTPUT_MODE, TXDXAI_INGEST_URL, TXDXAI_COMPANY_ID, TXDXAI_API_KEY,
     COLLECTOR, POLL_SECONDS, STATE_PATH, META_MAX_KB,
-    GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD,
+    GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD, GVM_SOCKET,
     DEBUG, MAX_ERROR_REPEAT
 )
 
@@ -33,69 +32,36 @@ def _is_win_error(e: BaseException, code: int) -> bool:
 
 
 def _suggestion(step: str, e: BaseException, context: dict) -> str:
-    """
-    Sugerencias con cobertura alta: red, DNS, TLS, permisos, XML, JSON, módulos, auth.
-    """
-    # 1) Módulos faltantes
     if isinstance(e, ModuleNotFoundError):
         if "gvm" in str(e).lower():
-            return "Falta python-gvm en ESTE entorno/venv. Instala deps en ese venv o usa COLLECTOR=simulated."
+            return "Falta python-gvm en ESTE entorno/venv. Instala deps o usa COLLECTOR=simulated."
         return "Falta un módulo. Verifica requirements y que el venv esté activo."
 
-    # 2) DNS / socket / red
     if isinstance(e, socket.gaierror):
         return "Error DNS (no resuelve host). Revisa nombre, DNS, o usa IP."
     if isinstance(e, TimeoutError):
-        # Windows 10060 / Linux timeout
         if _is_win_error(e, 10060):
-            return "El host/puerto no responde (WinError 10060). Verifica IP, puerto, firewall, que gvmd esté escuchando y red/VLAN."
-        return "Timeout: el host/servicio no respondió a tiempo. Verifica conectividad y carga del servidor."
+            return "Host/puerto no responde (WinError 10060). Verifica IP/puerto/firewall/gvmd."
+        return "Timeout: el host/servicio no respondió."
 
-    # 3) Conexión rechazada / no route
     if isinstance(e, ConnectionRefusedError):
-        return "Conexión rechazada: puerto cerrado o servicio caído. Verifica que gvmd escuche en ese puerto (9390 típicamente)."
+        return "Conexión rechazada: puerto cerrado o servicio caído."
     if _is_win_error(e, 10061):
-        return "WinError 10061: conexión rechazada. Puerto cerrado o firewall en destino."
-    if _is_win_error(e, 10065):
-        return "WinError 10065: no route to host. Revisa gateway/rutas/VLAN."
-    if _is_win_error(e, 10051):
-        return "WinError 10051: red inalcanzable. Revisa Wi-Fi/VLAN/rutas."
+        return "WinError 10061: conexión rechazada."
 
-    # 4) SSL/TLS (si se manifiesta en el stack)
     if "ssl" in type(e).__name__.lower() or "certificate" in str(e).lower():
-        return "Problema TLS/certificado. Usa certificados válidos, CA correcta o prueba en lab con config TLS adecuada."
+        return "Problema TLS/certificado."
 
-    # 5) XML
     if isinstance(e, ET.ParseError) or "ParseError" in type(e).__name__:
-        return "XML inválido/mal formado. Verifica que el reporte esté completo y que META_MAX_KB no lo corte."
+        return "XML inválido. Revisa META_MAX_KB o reporte."
 
-    # 6) JSON / state
-    if isinstance(e, ValueError) and "state" in step:
-        return "State corrupto o estructura inesperada. Borra state.json para reiniciar deduplicación."
-
-    # 7) Permisos / FS
     if isinstance(e, PermissionError):
-        return "Permiso denegado: revisa permisos en la carpeta/archivo (state.json, lock, etc.)."
-    if isinstance(e, FileNotFoundError):
-        return "Archivo no encontrado: revisa rutas/working directory y STATE_PATH."
+        return "Permiso denegado: revisa permisos."
 
-    # 8) Auth / credenciales (heurístico)
-    msg = str(e).lower()
-    if "unauthorized" in msg or "authentication" in msg or "not authorized" in msg or "login" in msg:
-        return "Falló autenticación. Revisa GVM_USERNAME/GVM_PASSWORD y permisos del usuario en gvmd."
-
-    return "Revisa variables de entorno, conectividad, puertos, servicio gvmd y logs del agente/servidor."
+    return "Revisa logs, variables y servicio gvmd."
 
 
 def handle_exception(step: str, e: BaseException, context: dict):
-    """
-    Handler central:
-    - Paso exacto + razón
-    - Contexto completo
-    - Sugerencia altamente específica
-    - Stacktrace si DEBUG=1
-    - Anti-spam por firma (MAX_ERROR_REPEAT)
-    """
     sig = _signature(step, e)
     _error_counts[sig] = _error_counts.get(sig, 0) + 1
     n = _error_counts[sig]
@@ -106,17 +72,13 @@ def handle_exception(step: str, e: BaseException, context: dict):
         return
 
     print("\n" + "!" * 90)
-    # Mensaje principal ultra detallado (incluye causa raíz y stacktrace si DEBUG)
-    # reutilizamos format_exception de services para consistencia
     print(format_exception(step, e, context))
-
-    # Sugerencia de alta cobertura
     print(f"Sugerencia: {_suggestion(step, e, context)}")
-
-    # Extra: tips por step
     if step.startswith("cycle.gvm"):
-        print("Tip: valida conectividad con Test-NetConnection (Windows) o nc/telnet (Linux) al puerto GMP (9390 típicamente).")
-
+        if GVM_SOCKET:
+            print(f"Tip: usando socket GMP: {GVM_SOCKET}")
+        else:
+            print("Tip: valida conectividad al puerto GMP (9390 típicamente).")
     print("!" * 90 + "\n")
 
 
@@ -146,10 +108,42 @@ def simulated_report_xml(report_id: str) -> str:
     """.strip()
 
 
+def _parse_result_count(task_node: ET.Element) -> dict[str, int] | None:
+    """
+    Intenta leer el resumen directo del task XML:
+      <last_report>...<result_count><high>..</high>...</result_count>...</last_report>
+    Si está, devuelve dict critical/high/medium/low.
+    """
+    rc = task_node.find(".//last_report//result_count")
+    if rc is None:
+        return None
+
+    def _get(tag: str) -> int:
+        try:
+            return int((rc.findtext(tag, "0") or "0").strip())
+        except Exception:
+            return 0
+
+    # GVM puede usar critical/high/medium/low o equivalentes viejos.
+    out = {
+        "critical": _get("critical"),
+        "high": _get("high"),
+        "medium": _get("medium"),
+        "low": _get("low"),
+    }
+    # Si todo es 0 pero hay "hole/warning/info/log", igual devolvemos None
+    # para permitir fallback a get_report.
+    if out["critical"] == 0 and out["high"] == 0 and out["medium"] == 0 and out["low"] == 0:
+        return None
+    return out
+
+
 print("=== AGENTE GMP (LAB) ===")
 print(f"[{now()}] OUTPUT_MODE={OUTPUT_MODE} | COLLECTOR={COLLECTOR} | POLL_SECONDS={POLL_SECONDS}s")
 print(f"[{now()}] STATE_PATH={STATE_PATH} | META_MAX_KB={META_MAX_KB}KB")
 print(f"[{now()}] GVM_HOST={GVM_HOST}:{GVM_PORT}")
+if GVM_SOCKET:
+    print(f"[{now()}] GVM_SOCKET={GVM_SOCKET}")
 
 lock_path = f"{STATE_PATH}.lock"
 
@@ -158,76 +152,69 @@ while True:
 
     try:
         with FileLock(lock_path):
-            # STEP: load state
-            try:
-                state = load_state(STATE_PATH)
-                sent = set(state.get("sent", []))
-            except Exception as e:
-                handle_exception("cycle.state.load", e, {"STATE_PATH": STATE_PATH, "accion": "sent=set()"})
-                sent = set()
+            # load state
+            state = load_state(STATE_PATH)
+            sent = set(state.get("sent", []))
 
-            # STEP: get tasks
+            # get tasks
             tasks_xml = None
-            active_collector = COLLECTOR
+            active_collector = (COLLECTOR or "simulated").strip().lower()
 
             if active_collector == "gmp":
-                try:
-                    from gvm_client import GVMClient
-                    with GVMClient(GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD) as client:
-                        tasks_xml = client.get_tasks()
-                except ModuleNotFoundError as e:
-                    # fallback automático
-                    handle_exception("cycle.gvm.missing_module", e, {"accion": "fallback a simulated"})
-                    active_collector = "simulated"
-                    tasks_xml = simulated_tasks_xml()
-                except Exception as e:
-                    handle_exception("cycle.gvm.get_tasks", e, {"GVM_HOST": GVM_HOST, "GVM_PORT": GVM_PORT})
-                    raise  # sin tasks no seguimos este ciclo
+                from gvm_client import GVMClient
+                with GVMClient(
+                    GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD,
+                    socket_path=GVM_SOCKET
+                ) as client:
+                    tasks_xml = client.get_tasks()
 
             elif active_collector == "simulated":
                 tasks_xml = simulated_tasks_xml()
             else:
                 raise ValueError("COLLECTOR inválido. Usa 'gmp' o 'simulated'.")
 
-            # STEP: parse tasks
-            try:
-                if len(tasks_xml.encode("utf-8", errors="ignore")) > (META_MAX_KB * 1024):
-                    raise ValueError("XML de tasks excede META_MAX_KB")
-                root = ET.fromstring(tasks_xml)
-                tasks = root.findall(".//task")
-                print(f"[{now()}] Tareas detectadas: {len(tasks)}")
-            except Exception as e:
-                handle_exception("cycle.xml.parse_tasks", e, {"META_MAX_KB": META_MAX_KB})
-                raise
+            # parse tasks
+            if len(tasks_xml.encode("utf-8", errors="ignore")) > (META_MAX_KB * 1024):
+                raise ValueError("XML de tasks excede META_MAX_KB")
 
-            # STEP: process tasks
+            root = ET.fromstring(tasks_xml)
+            tasks = root.findall(".//task")
+            print(f"[{now()}] Tareas detectadas: {len(tasks)}")
+
             for idx, task in enumerate(tasks):
-                step_prefix = f"cycle.task[{idx}]"
-
                 try:
-                    last = task.find("last_report/report")
+                    last = task.find(".//last_report//report")
                     if last is None:
+                        if DEBUG:
+                            print(f"[{now()}] task[{idx}] sin last_report")
                         continue
 
                     report_id = last.get("id")
                     if not report_id:
+                        if DEBUG:
+                            print(f"[{now()}] task[{idx}] last_report sin id")
                         continue
 
                     if report_id in sent:
                         continue
 
-                    # get report
-                    if active_collector == "simulated":
-                        report_xml = simulated_report_xml(report_id)
-                    else:
-                        from gvm_client import GVMClient
-                        with GVMClient(GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD) as client:
-                            report_xml = client.get_report(report_id)
+                    # ✅ FAST PATH: usa result_count si existe
+                    severities = _parse_result_count(task)
 
-                    # extract severities
-                    severities = extract_severities(report_xml, max_kb=META_MAX_KB)
+                    # fallback: descargar reporte y parsear
+                    if severities is None:
+                        if active_collector == "simulated":
+                            report_xml = simulated_report_xml(report_id)
+                        else:
+                            from gvm_client import GVMClient
+                            with GVMClient(
+                                GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD,
+                                socket_path=GVM_SOCKET
+                            ) as client:
+                                report_xml = client.get_report(report_id)
 
-                    # build payload
+                        severities = extract_severities(report_xml, max_kb=META_MAX_KB)
+
                     payload = {
                         "companyId": TXDXAI_COMPANY_ID,
                         "scanId": report_id,
@@ -236,7 +223,6 @@ while True:
                         "results": severities,
                     }
 
-                    # emit payload
                     ok = emit_payload(
                         output_mode=OUTPUT_MODE,
                         url=TXDXAI_INGEST_URL,
@@ -248,13 +234,10 @@ while True:
 
                     if ok:
                         sent.add(report_id)
-                        try:
-                            save_state(STATE_PATH, {"sent": sorted(list(sent))})
-                        except Exception as e:
-                            handle_exception(f"{step_prefix}.state.save", e, {"STATE_PATH": STATE_PATH})
+                        save_state(STATE_PATH, {"sent": sorted(list(sent))})
 
                 except Exception as e:
-                    handle_exception(f"{step_prefix}.process", e, {"hint": "Fallo procesando task/report"})
+                    handle_exception(f"cycle.task[{idx}].process", e, {"hint": "Fallo procesando task/report"})
                     continue
 
     except KeyboardInterrupt:
