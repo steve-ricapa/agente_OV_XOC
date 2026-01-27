@@ -4,26 +4,36 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 import time
 import socket
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from typing import Any
+from collections import Counter
 
 from config import (
     OUTPUT_MODE, TXDXAI_INGEST_URL, TXDXAI_COMPANY_ID, TXDXAI_API_KEY,
     COLLECTOR, POLL_SECONDS, STATE_PATH, META_MAX_KB,
     GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD, GVM_SOCKET,
-    DEBUG, MAX_ERROR_REPEAT
+    GVM_TLS_CAFILE, GVM_TLS_CERTFILE, GVM_TLS_KEYFILE, GVM_TIMEOUT,
+    DEBUG, MAX_ERROR_REPEAT, DETAIL_LEVEL, TOP_N, REPORT_MAX_KB, FINDING_TEXT_MAX,
+    STATE_TTL_DAYS, STATE_MAX_ITEMS,
+    validate_config,
 )
 
-from services import FileLock, load_state, save_state, extract_severities, emit_payload, format_exception
+from services import (
+    FileLock, load_state, save_state, purge_sent,
+    extract_severities, extract_report_stats, extract_findings,
+    emit_payload, format_exception
+)
 
 
 def now() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat()
 
 
-_error_counts = {}
+_error_counts: dict[tuple, int] = {}
 
 
 def _signature(step: str, e: BaseException) -> tuple:
-    return (step, type(e).__name__, str(e))
+    return (step, type(e).__name__, str(e)[:200])
 
 
 def _is_win_error(e: BaseException, code: int) -> bool:
@@ -39,6 +49,7 @@ def _suggestion(step: str, e: BaseException, context: dict) -> str:
 
     if isinstance(e, socket.gaierror):
         return "Error DNS (no resuelve host). Revisa nombre, DNS, o usa IP."
+
     if isinstance(e, TimeoutError):
         if _is_win_error(e, 10060):
             return "Host/puerto no responde (WinError 10060). Verifica IP/puerto/firewall/gvmd."
@@ -53,7 +64,7 @@ def _suggestion(step: str, e: BaseException, context: dict) -> str:
         return "Problema TLS/certificado."
 
     if isinstance(e, ET.ParseError) or "ParseError" in type(e).__name__:
-        return "XML inválido. Revisa META_MAX_KB o reporte."
+        return "XML inválido. Revisa META_MAX_KB/REPORT_MAX_KB o reporte."
 
     if isinstance(e, PermissionError):
         return "Permiso denegado: revisa permisos."
@@ -74,20 +85,32 @@ def handle_exception(step: str, e: BaseException, context: dict):
     print("\n" + "!" * 90)
     print(format_exception(step, e, context))
     print(f"Sugerencia: {_suggestion(step, e, context)}")
+
     if step.startswith("cycle.gvm"):
         if GVM_SOCKET:
             print(f"Tip: usando socket GMP: {GVM_SOCKET}")
         else:
             print("Tip: valida conectividad al puerto GMP (9390 típicamente).")
+
     print("!" * 90 + "\n")
 
 
+def _lname(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+def _iter_by_lname(root: ET.Element, name: str):
+    for el in root.iter():
+        if _lname(el.tag) == name:
+            yield el
+
+
 def simulated_tasks_xml() -> str:
+    # con namespace para validar que el parser ya es robusto
     return """
-    <get_tasks_response>
+    <get_tasks_response xmlns="urn:gmp">
       <tasks>
-        <task><last_report><report id="sim-report-1"/></last_report></task>
-        <task><last_report><report id="sim-report-2"/></last_report></task>
+        <task id="sim-task-1"><name>Sim Task</name><last_report><report id="sim-report-1"/></last_report></task>
+        <task id="sim-task-2"><name>Sim Task 2</name><last_report><report id="sim-report-2"/></last_report></task>
       </tasks>
     </get_tasks_response>
     """.strip()
@@ -95,13 +118,13 @@ def simulated_tasks_xml() -> str:
 
 def simulated_report_xml(report_id: str) -> str:
     return f"""
-    <get_report_response>
+    <get_report_response xmlns="urn:gmp">
       <report id="{report_id}">
         <results>
-          <result><severity>9.3</severity></result>
-          <result><severity>7.5</severity></result>
-          <result><severity>5.0</severity></result>
-          <result><severity>3.2</severity></result>
+          <result><severity>9.3</severity><name>Critical sample</name><host>10.0.0.5</host><port>443/tcp</port></result>
+          <result><severity>7.5</severity><name>High sample</name><host>10.0.0.6</host><port>22/tcp</port></result>
+          <result><severity>5.0</severity><name>Medium sample</name><host>10.0.0.7</host><port>80/tcp</port></result>
+          <result><severity>3.2</severity><name>Low sample</name><host>10.0.0.8</host><port>53/udp</port></result>
         </results>
       </report>
     </get_report_response>
@@ -109,41 +132,145 @@ def simulated_report_xml(report_id: str) -> str:
 
 
 def _parse_result_count(task_node: ET.Element) -> dict[str, int] | None:
-    """
-    Intenta leer el resumen directo del task XML:
-      <last_report>...<result_count><high>..</high>...</result_count>...</last_report>
-    Si está, devuelve dict critical/high/medium/low.
-    """
-    rc = task_node.find(".//last_report//result_count")
+    # Busca result_count ignorando namespace
+    rc = None
+    for el in task_node.iter():
+        if _lname(el.tag) == "result_count":
+            rc = el
+            break
     if rc is None:
         return None
 
     def _get(tag: str) -> int:
-        try:
-            return int((rc.findtext(tag, "0") or "0").strip())
-        except Exception:
-            return 0
+        for ch in list(rc):
+            if _lname(ch.tag) == tag:
+                try:
+                    return int(((ch.text or "0").strip()))
+                except Exception:
+                    return 0
+        return 0
 
-    # GVM puede usar critical/high/medium/low o equivalentes viejos.
     out = {
         "critical": _get("critical"),
         "high": _get("high"),
         "medium": _get("medium"),
         "low": _get("low"),
     }
-    # Si todo es 0 pero hay "hole/warning/info/log", igual devolvemos None
-    # para permitir fallback a get_report.
+
     if out["critical"] == 0 and out["high"] == 0 and out["medium"] == 0 and out["low"] == 0:
         return None
+
     return out
 
 
+def _should_include_findings(detail: str) -> bool:
+    d = (detail or "summary").strip().lower()
+    return d in {"findings", "full", "all"}
+
+
+def _should_include_stats(detail: str) -> bool:
+    d = (detail or "summary").strip().lower()
+    return d in {"stats", "findings", "full", "all"}
+
+
+def build_dashboard_blocks(
+    results: dict[str, int] | None,
+    findings: list[dict[str, Any]] | None,
+    report_stats: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    r = results or {"critical": 0, "high": 0, "medium": 0, "low": 0}
+
+    risk_score = (
+        10 * int(r.get("critical", 0))
+        + 5 * int(r.get("high", 0))
+        + 2 * int(r.get("medium", 0))
+        + 1 * int(r.get("low", 0))
+    )
+
+    if int(r.get("critical", 0)) > 0:
+        risk_label = "critical"
+    elif int(r.get("high", 0)) > 0:
+        risk_label = "high"
+    elif int(r.get("medium", 0)) > 0:
+        risk_label = "medium"
+    else:
+        risk_label = "low"
+
+    hosts = Counter()
+    ports = Counter()
+    cves = Counter()
+
+    max_sev = 0.0
+    sum_sev = 0.0
+    cnt_sev = 0
+
+    if findings:
+        for f in findings:
+            h = str(f.get("host", "") or "").strip()
+            p = str(f.get("port", "") or "").strip()
+
+            if h:
+                hosts[h] += 1
+            if p:
+                ports[p] += 1
+
+            for c in (f.get("cves") or []):
+                c = str(c).strip()
+                if c:
+                    cves[c] += 1
+
+            try:
+                sev = float(f.get("severity", 0.0))
+            except Exception:
+                sev = 0.0
+
+            if sev > max_sev:
+                max_sev = sev
+            sum_sev += sev
+            cnt_sev += 1
+
+    entities = {
+        "assetsTop": hosts.most_common(10),
+        "portsTop": ports.most_common(10),
+        "cvesTop": cves.most_common(10),
+    }
+
+    metrics: dict[str, Any] = {
+        "riskScore": risk_score,
+        "riskLabel": risk_label,
+        "findingsInPayload": len(findings or []),
+        "uniqueHostsInPayload": len(hosts),
+        "uniquePortsInPayload": len(ports),
+        "uniqueCvesInPayload": len(cves),
+        "maxSeverityInPayload": max_sev,
+        "avgSeverityInPayload": (sum_sev / cnt_sev) if cnt_sev else 0.0,
+    }
+
+    if report_stats:
+        try:
+            metrics["hostsCount"] = int(report_stats.get("hosts_count", 0) or 0)
+            metrics["vulnsCount"] = int(report_stats.get("vulns_count", 0) or 0)
+        except Exception:
+            pass
+
+    return metrics, entities
+
+
 print("=== AGENTE GMP (LAB) ===")
+
+# ✅ valida config al arranque (falla rápido con mensaje claro)
+try:
+    validate_config()
+except Exception as e:
+    handle_exception("startup.validate_config", e, {})
+    raise
+
 print(f"[{now()}] OUTPUT_MODE={OUTPUT_MODE} | COLLECTOR={COLLECTOR} | POLL_SECONDS={POLL_SECONDS}s")
 print(f"[{now()}] STATE_PATH={STATE_PATH} | META_MAX_KB={META_MAX_KB}KB")
 print(f"[{now()}] GVM_HOST={GVM_HOST}:{GVM_PORT}")
 if GVM_SOCKET:
     print(f"[{now()}] GVM_SOCKET={GVM_SOCKET}")
+print(f"[{now()}] DETAIL_LEVEL={DETAIL_LEVEL} | TOP_N={TOP_N} | REPORT_MAX_KB={REPORT_MAX_KB}KB | FINDING_TEXT_MAX={FINDING_TEXT_MAX}")
 
 lock_path = f"{STATE_PATH}.lock"
 
@@ -152,11 +279,12 @@ while True:
 
     try:
         with FileLock(lock_path):
-            # load state
             state = load_state(STATE_PATH)
-            sent = set(state.get("sent", []))
+            sent_map = state.get("sent", {})
+            if not isinstance(sent_map, dict):
+                sent_map = {}
+            sent_map = purge_sent(sent_map, max_age_days=int(STATE_TTL_DAYS), max_items=int(STATE_MAX_ITEMS))
 
-            # get tasks
             tasks_xml = None
             active_collector = (COLLECTOR or "simulated").strip().lower()
 
@@ -164,7 +292,11 @@ while True:
                 from gvm_client import GVMClient
                 with GVMClient(
                     GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD,
-                    socket_path=GVM_SOCKET
+                    socket_path=GVM_SOCKET,
+                    cafile=GVM_TLS_CAFILE,
+                    certfile=GVM_TLS_CERTFILE,
+                    keyfile=GVM_TLS_KEYFILE,
+                    timeout=GVM_TIMEOUT,
                 ) as client:
                     tasks_xml = client.get_tasks()
 
@@ -173,55 +305,118 @@ while True:
             else:
                 raise ValueError("COLLECTOR inválido. Usa 'gmp' o 'simulated'.")
 
-            # parse tasks
             if len(tasks_xml.encode("utf-8", errors="ignore")) > (META_MAX_KB * 1024):
                 raise ValueError("XML de tasks excede META_MAX_KB")
 
             root = ET.fromstring(tasks_xml)
-            tasks = root.findall(".//task")
+            tasks = list(_iter_by_lname(root, "task"))
             print(f"[{now()}] Tareas detectadas: {len(tasks)}")
 
             for idx, task in enumerate(tasks):
                 try:
-                    last = task.find(".//last_report//report")
-                    if last is None:
-                        if DEBUG:
-                            print(f"[{now()}] task[{idx}] sin last_report")
-                        continue
+                    # Buscar last_report id robusto (con/sin <report>)
+                    report_id = ""
 
-                    report_id = last.get("id")
+                    # 1) last_report con id directo
+                    for lr in _iter_by_lname(task, "last_report"):
+                        rid = (lr.get("id") or "").strip()
+                        if rid:
+                            report_id = rid
+                            break
+                        # 2) last_report/report id
+                        for rp in lr.iter():
+                            if _lname(rp.tag) == "report":
+                                rid2 = (rp.get("id") or "").strip()
+                                if rid2:
+                                    report_id = rid2
+                                    break
+                            if report_id:
+                                break
+                        if report_id:
+                            break
+
                     if not report_id:
                         if DEBUG:
-                            print(f"[{now()}] task[{idx}] last_report sin id")
+                            print(f"[{now()}] task[{idx}] sin report_id")
                         continue
 
-                    if report_id in sent:
+                    if report_id in sent_map:
                         continue
 
-                    # ✅ FAST PATH: usa result_count si existe
+                    task_id = (task.get("id") or "").strip()
+                    task_name = ""
+                    for el in list(task):
+                        if _lname(el.tag) == "name":
+                            task_name = (el.text or "").strip()
+                            break
+
+                    meta: dict[str, Any] = {"taskId": task_id, "taskName": task_name}
+
                     severities = _parse_result_count(task)
 
-                    # fallback: descargar reporte y parsear
-                    if severities is None:
+                    report_xml: str | None = None
+                    report_stats: dict[str, Any] | None = None
+                    findings: list[dict[str, Any]] | None = None
+
+                    need_report = (
+                        (severities is None)
+                        or _should_include_stats(DETAIL_LEVEL)
+                        or _should_include_findings(DETAIL_LEVEL)
+                    )
+
+                    if need_report:
                         if active_collector == "simulated":
                             report_xml = simulated_report_xml(report_id)
                         else:
                             from gvm_client import GVMClient
                             with GVMClient(
                                 GVM_HOST, GVM_PORT, GVM_USERNAME, GVM_PASSWORD,
-                                socket_path=GVM_SOCKET
+                                socket_path=GVM_SOCKET,
+                                cafile=GVM_TLS_CAFILE,
+                                certfile=GVM_TLS_CERTFILE,
+                                keyfile=GVM_TLS_KEYFILE,
+                                timeout=GVM_TIMEOUT,
                             ) as client:
                                 report_xml = client.get_report(report_id)
 
-                        severities = extract_severities(report_xml, max_kb=META_MAX_KB)
+                        if severities is None:
+                            severities = extract_severities(report_xml, max_kb=REPORT_MAX_KB)
 
-                    payload = {
+                        if _should_include_stats(DETAIL_LEVEL):
+                            report_stats = extract_report_stats(report_xml, max_kb=REPORT_MAX_KB)
+
+                        if _should_include_findings(DETAIL_LEVEL):
+                            findings = extract_findings(
+                                report_xml,
+                                top_n=int(TOP_N),
+                                text_max=int(FINDING_TEXT_MAX),
+                                max_kb=REPORT_MAX_KB
+                            )
+
+                    metrics, entities = build_dashboard_blocks(severities, findings, report_stats)
+
+                    payload: dict[str, Any] = {
+                        "eventType": "vuln_scan_report",
                         "companyId": TXDXAI_COMPANY_ID,
                         "scanId": report_id,
-                        "scannerType": "openvas",
-                        "collector": active_collector,
-                        "results": severities,
+                        "scanner": {"type": "openvas", "collector": active_collector, "transport": "gmp"},
+                        "meta": meta,
+                        "results": severities or {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                        "detailLevel": (DETAIL_LEVEL or "summary"),
+                        "generatedAt": now(),
+                        "metrics": metrics,
+                        "entities": entities,
+                        "limits": {
+                            "topN": int(TOP_N),
+                            "findingTextMax": int(FINDING_TEXT_MAX),
+                            "reportMaxKB": int(REPORT_MAX_KB),
+                        },
                     }
+
+                    if report_stats is not None:
+                        payload["reportStats"] = report_stats
+                    if findings is not None:
+                        payload["findings"] = findings
 
                     ok = emit_payload(
                         output_mode=OUTPUT_MODE,
@@ -233,8 +428,8 @@ while True:
                     )
 
                     if ok:
-                        sent.add(report_id)
-                        save_state(STATE_PATH, {"sent": sorted(list(sent))})
+                        sent_map[report_id] = int(time.time())
+                        save_state(STATE_PATH, {"sent": sent_map})
 
                 except Exception as e:
                     handle_exception(f"cycle.task[{idx}].process", e, {"hint": "Fallo procesando task/report"})

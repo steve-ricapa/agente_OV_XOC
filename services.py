@@ -28,12 +28,9 @@ DEBUG = _bool_env("DEBUG", False)
 
 
 def _root_cause(e: BaseException) -> str:
-    """Devuelve una causa raíz legible (si existe)."""
-    # __cause__ se setea con `raise X from Y`
     if getattr(e, "__cause__", None) is not None:
         c = e.__cause__
         return f"{type(c).__name__}: {c}"
-    # __context__ puede existir si hubo una excepción previa
     if getattr(e, "__context__", None) is not None:
         c = e.__context__
         return f"{type(c).__name__}: {c}"
@@ -41,14 +38,6 @@ def _root_cause(e: BaseException) -> str:
 
 
 def format_exception(step: str, e: BaseException, context: Optional[dict[str, Any]] = None) -> str:
-    """
-    Mensaje ultra detallado:
-    - step (punto exacto)
-    - tipo/motivo
-    - causa raíz (si existe)
-    - contexto clave/valor
-    - stacktrace (DEBUG=1)
-    """
     parts = []
     parts.append(f"[{_now()}] ERROR @ {step}")
     parts.append(f"Tipo: {type(e).__name__}")
@@ -92,42 +81,104 @@ class FileLock:
         except Exception:
             pass
         try:
-            self.f.close()
+            if self.f:
+                self.f.close()
         except Exception:
             pass
 
 
+# -------------------------
+# STATE (compatible con main.py actual)
+# -------------------------
+
 def load_state(path: str) -> dict[str, Any]:
+    """
+    Soporta 2 formatos:
+      - Nuevo: {"sent": {"<report_id>": <unix_ts>, ...}}
+      - Antiguo: {"sent": ["id1","id2",...]} -> migra a dict con ts=0
+    """
     step = "services.load_state"
     try:
         if not os.path.exists(path):
-            return {"sent": []}
+            return {"sent": {}}
+
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         if not isinstance(data, dict):
             raise ValueError("state.json no es dict")
-        sent = data.get("sent", [])
-        if not isinstance(sent, list):
-            raise ValueError("state.json['sent'] no es lista")
-        data["sent"] = [str(x) for x in sent if x is not None]
+
+        sent = data.get("sent", {})
+
+        # Formato nuevo: dict
+        if isinstance(sent, dict):
+            out: dict[str, int] = {}
+            for k, v in sent.items():
+                if k is None:
+                    continue
+                rid = str(k).strip()
+                if not rid:
+                    continue
+                try:
+                    out[rid] = int(v)
+                except Exception:
+                    out[rid] = 0
+            data["sent"] = out
+            return data
+
+        # Formato viejo: lista -> migra a dict(ts=0)
+        if isinstance(sent, list):
+            out2: dict[str, int] = {}
+            for x in sent:
+                if x is None:
+                    continue
+                rid = str(x).strip()
+                if rid:
+                    out2[rid] = 0
+            data["sent"] = out2
+            return data
+
+        # Raro -> reset
+        data["sent"] = {}
         return data
+
     except json.JSONDecodeError as e:
         print(format_exception(step, e, {"path": path, "accion": "estado reiniciado"}))
-        return {"sent": []}
+        return {"sent": {}}
     except Exception as e:
         print(format_exception(step, e, {"path": path, "accion": "estado reiniciado"}))
-        return {"sent": []}
+        return {"sent": {}}
 
 
 def save_state(path: str, data: dict[str, Any]) -> None:
+    """
+    Guarda SOLO formato nuevo:
+      {"sent": {"report_id": unix_ts, ...}}
+    """
     step = "services.save_state"
     tmp = f"{path}.tmp"
     try:
-        if "sent" not in data or not isinstance(data["sent"], list):
-            raise ValueError("data debe contener sent:list")
+        sent = data.get("sent", {})
+        if not isinstance(sent, dict):
+            raise ValueError("data['sent'] debe ser dict {report_id: timestamp}")
+
+        clean: dict[str, int] = {}
+        for k, v in sent.items():
+            if k is None:
+                continue
+            rid = str(k).strip()
+            if not rid:
+                continue
+            try:
+                clean[rid] = int(v)
+            except Exception:
+                clean[rid] = 0
+
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump({"sent": clean}, f, indent=2, ensure_ascii=False)
+
         os.replace(tmp, path)
+
     except Exception as e:
         print(format_exception(step, e, {"path": path, "tmp": tmp}))
         raise
@@ -139,26 +190,133 @@ def save_state(path: str, data: dict[str, Any]) -> None:
             pass
 
 
+def purge_sent(
+    sent_map: dict[str, Any],
+    *,
+    max_age_days: int = 30,
+    max_items: int = 5000
+) -> dict[str, int]:
+    """
+    Limpia el mapa de reportes ya enviados:
+      sent_map = { report_id: unix_ts }
+
+    - max_age_days: elimina entradas más viejas que N días (si ts>0)
+    - max_items: si hay demasiadas, conserva solo las más recientes
+
+    Retorna dict[str,int] limpio.
+    """
+    step = "services.purge_sent"
+    try:
+        if not isinstance(sent_map, dict):
+            return {}
+
+        now_ts = int(time.time())
+        cutoff = now_ts - max(0, int(max_age_days)) * 86400
+
+        cleaned: dict[str, int] = {}
+        for rid, ts in sent_map.items():
+            if rid is None:
+                continue
+            rid_s = str(rid).strip()
+            if not rid_s:
+                continue
+
+            try:
+                ts_i = int(ts)
+            except Exception:
+                ts_i = 0
+
+            # ts=0 (migrado/legacy) -> se conserva
+            if ts_i == 0 or ts_i >= cutoff:
+                cleaned[rid_s] = ts_i
+
+        mi = int(max_items)
+        if mi > 0 and len(cleaned) > mi:
+            items = sorted(cleaned.items(), key=lambda kv: kv[1], reverse=True)[:mi]
+            cleaned = {k: v for k, v in items}
+
+        return cleaned
+
+    except Exception as e:
+        print(format_exception(step, e, {"max_age_days": max_age_days, "max_items": max_items}))
+        try:
+            return {str(k): int(v) for k, v in (sent_map or {}).items() if k is not None}
+        except Exception:
+            return {}
+
+
+# -------------------------
+# XML parsing helpers
+# -------------------------
+
+def _clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    if n <= 0:
+        return s
+    return s[:n]
+
+
+def _parse_xml(xml_text: str, max_kb: int) -> Any:
+    if not isinstance(xml_text, str) or not xml_text:
+        raise ValueError("XML vacío o no str")
+
+    max_bytes = int(max_kb) * 1024
+    size = len(xml_text.encode("utf-8", errors="ignore"))
+    if size > max_bytes:
+        raise ValueError(f"XML excede límite: {size} bytes > {max_bytes} bytes")
+
+    ET = SafeET if SafeET is not None else StdET
+    root = ET.fromstring(xml_text)  # type: ignore
+
+    # Quita namespaces: "{...}severity" -> "severity"
+    for el in root.iter():
+        if isinstance(el.tag, str) and "}" in el.tag:
+            el.tag = el.tag.split("}", 1)[1]
+
+    return root
+
+
+def _result_nodes(root: Any) -> list[Any]:
+    """
+    Tomar resultados preferentemente del reporte:
+      report/results/result
+    Evita capturar otros <result> que no son findings reales.
+    """
+    nodes = root.findall(".//report//results//result")
+    if nodes:
+        return nodes
+    nodes = root.findall(".//results//result")
+    if nodes:
+        return nodes
+    return root.findall(".//result")
+
+
+def _safe_float(s: str, default: float = 0.0) -> float:
+    try:
+        return float((s or "").strip())
+    except Exception:
+        return default
+
+
+def _safe_int(s: str, default: int = 0) -> int:
+    try:
+        return int((s or "").strip())
+    except Exception:
+        return default
+
+
+# -------------------------
+# Extractors
+# -------------------------
+
 def extract_severities(xml_text: str, max_kb: int = 256) -> dict[str, int]:
     step = "services.extract_severities"
     try:
-        if not isinstance(xml_text, str) or not xml_text:
-            raise ValueError("XML vacío o no str")
-
-        max_bytes = int(max_kb) * 1024
-        size = len(xml_text.encode("utf-8", errors="ignore"))
-        if size > max_bytes:
-            raise ValueError(f"XML excede límite: {size} bytes > {max_bytes} bytes")
-
-        ET = SafeET if SafeET is not None else StdET
-        root = ET.fromstring(xml_text)  # type: ignore
+        root = _parse_xml(xml_text, max_kb=max_kb)
 
         out = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for r in root.findall(".//result"):
-            try:
-                sev = float(r.findtext("severity", "0") or "0")
-            except Exception:
-                continue
+        for r in _result_nodes(root):
+            sev = _safe_float(r.findtext("severity", "") or "0", 0.0)
 
             if sev >= 9.0:
                 out["critical"] += 1
@@ -179,6 +337,125 @@ def extract_severities(xml_text: str, max_kb: int = 256) -> dict[str, int]:
         raise
 
 
+def extract_report_stats(xml_text: str, max_kb: int = 4096) -> dict[str, int]:
+    if not xml_text:
+        return {}
+
+    root = _parse_xml(xml_text, max_kb=max_kb)
+
+    def _int(path: str) -> int:
+        return _safe_int(root.findtext(path, "0") or "0", 0)
+
+    return {
+        "hosts_count": _int(".//report//hosts//count"),
+        "vulns_count": _int(".//report//vulns//count"),
+        "apps_count": _int(".//report//apps//count"),
+        "os_count": _int(".//report//os//count"),
+        "ssl_certs_count": _int(".//report//ssl_certs//count"),
+    }
+
+
+def _extract_severity_from_result(r: Any) -> float:
+    """
+    Preferimos el severity del <result>.
+    Si viene vacío, intentamos fallback a NVT severities/value.
+    """
+    sev = _safe_float(r.findtext("severity", "") or "", 0.0)
+    if sev > 0.0:
+        return sev
+
+    nvt = r.find("nvt")
+    if nvt is None:
+        return 0.0
+
+    v = (nvt.findtext(".//severities//severity//value", "") or "").strip()
+    return _safe_float(v, 0.0)
+
+
+def extract_findings(
+    xml_text: str,
+    *,
+    top_n: int = 50,
+    text_max: int = 300,
+    max_kb: int = 4096
+) -> list[dict[str, Any]]:
+    """
+    Extrae findings (vulns) desde <result>:
+    name, severity, qod, host, port, nvt_oid, cves, summary/solution.
+    Ordena por severity desc y retorna top_n.
+    """
+    if not xml_text:
+        return []
+
+    root = _parse_xml(xml_text, max_kb=max_kb)
+
+    findings: list[dict[str, Any]] = []
+
+    for r in _result_nodes(root):
+        try:
+            name = (r.findtext("name", "") or "").strip()
+            host = (r.findtext("host", "") or "").strip()
+            port = (r.findtext("port", "") or "").strip()
+
+            qod = _safe_int(r.findtext(".//qod//value", "0") or "0", 0)
+
+            nvt = r.find("nvt")
+            nvt_oid = (nvt.get("oid") or "").strip() if nvt is not None else ""
+
+            # filtro anti-basura
+            if (not host and not port and not nvt_oid) or (name.lower() == "product"):
+                continue
+
+            sev = _extract_severity_from_result(r)
+
+            # CVEs
+            cves: list[str] = []
+            if nvt is not None:
+                for ref in nvt.findall(".//ref"):
+                    t = (ref.get("type") or "").lower()
+                    if t == "cve":
+                        cid = (ref.get("id") or "").strip()
+                        if cid:
+                            cves.append(cid)
+
+                cve_text = (nvt.findtext("cve", "") or "").strip()
+                if cve_text:
+                    for part in cve_text.replace(",", " ").split():
+                        if part.upper().startswith("CVE-"):
+                            cves.append(part.strip())
+
+            seen = set()
+            cves = [x for x in cves if not (x in seen or seen.add(x))]
+
+            summary = (nvt.findtext("summary", "") or "").strip() if nvt is not None else ""
+            solution = (nvt.findtext("solution", "") or "").strip() if nvt is not None else ""
+
+            finding = {
+                "name": _clip(name, text_max),
+                "severity": float(sev),
+                "qod": int(qod),
+                "host": host,
+                "port": port,
+                "nvt_oid": nvt_oid,
+                "cves": cves[:10],
+                "summary": _clip(summary, text_max),
+                "solution": _clip(solution, text_max),
+            }
+
+            if finding["name"] and (finding["host"] or finding["nvt_oid"]):
+                findings.append(finding)
+
+        except Exception:
+            continue
+
+    findings.sort(key=lambda x: float(x.get("severity", 0.0)), reverse=True)
+    return findings[: max(0, int(top_n))]
+
+
+# -------------------------
+# Emit payload
+# -------------------------
+
 def emit_payload(
     *,
     output_mode: str,
@@ -191,10 +468,15 @@ def emit_payload(
     step = "services.emit_payload"
     mode = (output_mode or "console").strip().lower()
 
+    tls_verify_env = os.getenv("BACKEND_TLS_VERIFY", "true").strip().lower()
+    tls_verify = tls_verify_env in {"1", "true", "yes", "y", "on"}
+
     try:
         if mode == "console":
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             print("\n" + "=" * 90)
             print(f"[{_now()}] TXDXAI INGEST (console-only)")
+            print(f"[{_now()}] Payload size: {len(raw)/1024:.1f} KB")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             print("=" * 90 + "\n")
             return True
@@ -209,7 +491,20 @@ def emit_payload(
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if not tls_verify:
+            try:
+                import urllib3  # type: ignore
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+
+        r = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            verify=tls_verify,
+        )
 
         if 200 <= r.status_code < 300:
             print(f"[{_now()}] OK backend ({r.status_code})")
@@ -219,7 +514,7 @@ def emit_payload(
         raise RuntimeError(f"Backend rechazó: HTTP {r.status_code}. Respuesta: {snippet}")
 
     except requests.exceptions.SSLError as e:
-        print(format_exception(step, e, {"url": url, "hint": "TLS/certificados"}))
+        print(format_exception(step, e, {"url": url, "tls_verify": tls_verify, "hint": "TLS/certificados"}))
         return False
     except requests.exceptions.ConnectionError as e:
         print(format_exception(step, e, {"url": url, "hint": "DNS/ruta/firewall"}))
