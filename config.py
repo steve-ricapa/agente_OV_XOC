@@ -51,7 +51,7 @@ GVM_TLS_CERTFILE = _env("GVM_TLS_CERTFILE", "") or ""
 GVM_TLS_KEYFILE  = _env("GVM_TLS_KEYFILE", "") or ""
 GVM_TIMEOUT = _env_int("GVM_TIMEOUT", 30)
 
-DETAIL_LEVEL = (_env("DETAIL_LEVEL", "summary") or "summary").strip().lower()
+DETAIL_LEVEL = (_env("DETAIL_LEVEL", "findings") or "findings").strip().lower()
 TOP_N = _env_int("TOP_N", 50)
 REPORT_MAX_KB = _env_int("REPORT_MAX_KB", 4096)
 FINDING_TEXT_MAX = _env_int("FINDING_TEXT_MAX", 300)

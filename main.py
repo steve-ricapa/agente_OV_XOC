@@ -98,6 +98,7 @@ def handle_exception(step: str, e: BaseException, context: dict):
 def _lname(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
+
 def _iter_by_lname(root: ET.Element, name: str):
     for el in root.iter():
         if _lname(el.tag) == name:
@@ -120,11 +121,25 @@ def simulated_report_xml(report_id: str) -> str:
     return f"""
     <get_report_response xmlns="urn:gmp">
       <report id="{report_id}">
+        <hosts><count>2</count></hosts>
+        <vulns><count>4</count></vulns>
         <results>
-          <result><severity>9.3</severity><name>Critical sample</name><host>10.0.0.5</host><port>443/tcp</port></result>
+          <result>
+            <name>Vulnerabilidad Crítica</name>
+            <severity>10.0</severity>
+            <host>192.168.1.10</host>
+            <port>22/tcp</port>
+            <nvt oid="1.3.6.1.4.1.25623.1.0.12345">
+              <description>Descripción detallada de la vulnerabilidad crítica.</description>
+              <impact>Impacto severo en la confidencialidad.</impact>
+              <solution>Actualizar el servicio inmediatamente.</solution>
+              <ref type="cve" id="CVE-2024-0001"/>
+            </nvt>
+          </result>
           <result><severity>7.5</severity><name>High sample</name><host>10.0.0.6</host><port>22/tcp</port></result>
           <result><severity>5.0</severity><name>Medium sample</name><host>10.0.0.7</host><port>80/tcp</port></result>
           <result><severity>3.2</severity><name>Low sample</name><host>10.0.0.8</host><port>53/udp</port></result>
+          <result><severity>0.0</severity><name>Info sample</name><host>10.0.0.9</host><port>general</port></result>
         </results>
       </report>
     </get_report_response>
@@ -145,6 +160,7 @@ def _parse_result_count(task_node: ET.Element) -> dict[str, int] | None:
         for ch in list(rc):
             if _lname(ch.tag) == tag:
                 try:
+                    # En GVM 20.08+ a veces existen estos tags dentro de result_count
                     return int(((ch.text or "0").strip()))
                 except Exception:
                     return 0
@@ -155,9 +171,10 @@ def _parse_result_count(task_node: ET.Element) -> dict[str, int] | None:
         "high": _get("high"),
         "medium": _get("medium"),
         "low": _get("low"),
+        "info": _get("info") or _get("log"), # Fallback log/info
     }
 
-    if out["critical"] == 0 and out["high"] == 0 and out["medium"] == 0 and out["low"] == 0:
+    if all(v == 0 for v in out.values()):
         return None
 
     return out
@@ -395,33 +412,61 @@ while True:
 
                     metrics, entities = build_dashboard_blocks(severities, findings, report_stats)
 
-                    payload: dict[str, Any] = {
-                        "eventType": "vuln_scan_report",
-                        "companyId": TXDXAI_COMPANY_ID,
-                        "scanId": report_id,
-                        "scanner": {"type": "openvas", "collector": active_collector, "transport": "gmp"},
-                        "meta": meta,
-                        "results": severities or {"critical": 0, "high": 0, "medium": 0, "low": 0},
-                        "detailLevel": (DETAIL_LEVEL or "summary"),
-                        "generatedAt": now(),
-                        "metrics": metrics,
-                        "entities": entities,
-                        "limits": {
-                            "topN": int(TOP_N),
-                            "findingTextMax": int(FINDING_TEXT_MAX),
-                            "reportMaxKB": int(REPORT_MAX_KB),
-                        },
-                    }
+                    counts = severities or {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+                    total_hosts = int(report_stats.get("hosts_count", 0)) if report_stats else 0
+                    
+                    # Si no hay stats pero hay findings, contamos hosts únicos en findings
+                    if total_hosts == 0 and findings:
+                        total_hosts = len(set(f.get("host") for f in findings if f.get("host")))
 
-                    if report_stats is not None:
-                        payload["reportStats"] = report_stats
-                    if findings is not None:
-                        payload["findings"] = findings
+                    cvss_max = 0.0
+                    if findings:
+                        cvss_max = max((float(f.get("cvss", 0.0)) for f in findings), default=0.0)
+
+                    # ------------------------------------------------------------------
+                    # ✅ High-Fidelity Production Refactor:
+                    # - scan_summary: includes cvss_max and official report_id
+                    # - results: used for counts (backend req)
+                    # - findings: detailed list (rich details from services.py)
+                    # ------------------------------------------------------------------
+                    scanned_at = now()
+
+                    payload: dict[str, Any] = {
+                        # Requeridos por el Backend (para el OK 201 y compatibilidad de esquema)
+                        "scanId": report_id,
+                        "companyId": TXDXAI_COMPANY_ID,
+                        "apiKey": TXDXAI_API_KEY,
+                        "scannedAt": scanned_at,
+                        "eventType": "vuln_scan_report",
+                        
+                        # El Backend exige que 'results' sea un OBJETO para no dar Error 400
+                        "results": counts, 
+                        
+                        # La lista detallada de hallazgos (Alta Fidelidad)
+                        "findings": findings or [],
+
+                        # Estructura del Prompt: Resumen Ejecutivo
+                        "scan_summary": {
+                            "scan_id": report_id,
+                            "scan_name": task_name,
+                            "status": "completed",
+                            "severity_counts": counts, # Versión agrupada para el dashboard
+                            "critical_count": counts.get("critical", 0),
+                            "high_count": counts.get("high", 0),
+                            "medium_count": counts.get("medium", 0),
+                            "low_count": counts.get("low", 0),
+                            "info_count": counts.get("info", 0),
+                            "total_hosts": total_hosts,
+                            "scanned_at": scanned_at,
+                            "cvss_max": cvss_max
+                        }
+                    }
 
                     ok = emit_payload(
                         output_mode=OUTPUT_MODE,
                         url=TXDXAI_INGEST_URL,
                         api_key=TXDXAI_API_KEY,
+                        company_id=TXDXAI_COMPANY_ID,
                         payload=payload,
                         timeout=15,
                         require_https=True,

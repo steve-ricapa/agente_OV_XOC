@@ -256,6 +256,32 @@ def _clip(s: str, n: int) -> str:
     return s[:n]
 
 
+def _clean_text(text: str) -> str:
+    """Elimina etiquetas innecesarias y espacios excesivos para legibilidad."""
+    if not text:
+        return ""
+    import re
+    # Eliminar etiquetas HTML/XML si existen (OpenVAS a veces mete tags de estilo)
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Colapsar espacios y saltos de línea múltiples
+    text = " ".join(text.split())
+    return text.strip()
+
+
+def get_severity_label(cvss_score: float) -> str:
+    """Normaliza el string de severidad según el estándar del proyecto."""
+    s = float(cvss_score)
+    if s >= 9.0:
+        return "critical"
+    if s >= 7.0:
+        return "high"
+    if s >= 4.0:
+        return "medium"
+    if s > 0.0:
+        return "low"
+    return "info"
+
+
 def _parse_xml(xml_text: str, max_kb: int) -> Any:
     if not isinstance(xml_text, str) or not xml_text:
         raise ValueError("XML vacío o no str")
@@ -314,7 +340,7 @@ def extract_severities(xml_text: str, max_kb: int = 256) -> dict[str, int]:
     try:
         root = _parse_xml(xml_text, max_kb=max_kb)
 
-        out = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        out = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
         for r in _result_nodes(root):
             sev = _safe_float(r.findtext("severity", "") or "0", 0.0)
 
@@ -324,8 +350,10 @@ def extract_severities(xml_text: str, max_kb: int = 256) -> dict[str, int]:
                 out["high"] += 1
             elif sev >= 4.0:
                 out["medium"] += 1
-            else:
+            elif sev > 0.0:
                 out["low"] += 1
+            else:
+                out["info"] += 1
 
         return out
 
@@ -381,7 +409,7 @@ def extract_findings(
 ) -> list[dict[str, Any]]:
     """
     Extrae findings (vulns) desde <result>:
-    name, severity, qod, host, port, nvt_oid, cves, summary/solution.
+    name, severity, cvss, cve, host, port, description, solution, impact.
     Ordena por severity desc y retorna top_n.
     """
     if not xml_text:
@@ -397,8 +425,6 @@ def extract_findings(
             host = (r.findtext("host", "") or "").strip()
             port = (r.findtext("port", "") or "").strip()
 
-            qod = _safe_int(r.findtext(".//qod//value", "0") or "0", 0)
-
             nvt = r.find("nvt")
             nvt_oid = (nvt.get("oid") or "").strip() if nvt is not None else ""
 
@@ -406,49 +432,76 @@ def extract_findings(
             if (not host and not port and not nvt_oid) or (name.lower() == "product"):
                 continue
 
-            sev = _extract_severity_from_result(r)
+            cvss = _extract_severity_from_result(r)
+            severity_str = get_severity_label(cvss)
 
-            # CVEs
-            cves: list[str] = []
+            # CVEs: solo capturamos el primero para el campo 'cve' del contrato
+            cve_id = None
             if nvt is not None:
                 for ref in nvt.findall(".//ref"):
                     t = (ref.get("type") or "").lower()
                     if t == "cve":
                         cid = (ref.get("id") or "").strip()
                         if cid:
-                            cves.append(cid)
+                            cve_id = cid
+                            break
+                
+                if not cve_id:
+                    cve_text = (nvt.findtext("cve", "") or "").strip()
+                    if cve_text:
+                        parts = cve_text.replace(",", " ").split()
+                        for part in parts:
+                            if part.upper().startswith("CVE-"):
+                                cve_id = part.strip()
+                                break
+            
+            # Null handling para CVE
+            if not cve_id:
+                cve_id = "No CVE assigned"
 
-                cve_text = (nvt.findtext("cve", "") or "").strip()
-                if cve_text:
-                    for part in cve_text.replace(",", " ").split():
-                        if part.upper().startswith("CVE-"):
-                            cves.append(part.strip())
+            description_raw = (nvt.findtext("description", "") or "").strip() if nvt is not None else ""
+            summary_raw = (nvt.findtext("summary", "") or "").strip() if nvt is not None else ""
+            
+            # Si description está vacío, usamos summary como fallback
+            raw_desc = description_raw if description_raw else summary_raw
+            final_desc = _clean_text(raw_desc) or "No description available"
+            
+            solution_raw = (nvt.findtext("solution", "") or "").strip() if nvt is not None else ""
+            final_solution = _clean_text(solution_raw) or "No solution provided"
+            
+            impact_raw = (nvt.findtext("impact", "") or "").strip() if nvt is not None else ""
+            final_impact = _clean_text(impact_raw) or "No impact information"
 
-            seen = set()
-            cves = [x for x in cves if not (x in seen or seen.add(x))]
-
-            summary = (nvt.findtext("summary", "") or "").strip() if nvt is not None else ""
-            solution = (nvt.findtext("solution", "") or "").strip() if nvt is not None else ""
+            # Protocolo: suele venir en 'port' como '80/tcp'
+            protocol = ""
+            if "/" in port:
+                port_parts = port.split("/", 1)
+                port_val = port_parts[0]
+                protocol = port_parts[1]
+            else:
+                port_val = port
 
             finding = {
                 "name": _clip(name, text_max),
-                "severity": float(sev),
-                "qod": int(qod),
+                "severity": severity_str,
+                "cvss": float(cvss),
+                "cve": cve_id,
+                "oid": nvt_oid,
                 "host": host,
-                "port": port,
-                "nvt_oid": nvt_oid,
-                "cves": cves[:10],
-                "summary": _clip(summary, text_max),
-                "solution": _clip(solution, text_max),
+                "port": port_val,
+                "protocol": protocol,
+                "description": final_desc,  # Quitamos clip para no truncar info crítica según prompt
+                "solution": final_solution,
+                "impact": final_impact,
             }
 
-            if finding["name"] and (finding["host"] or finding["nvt_oid"]):
+            if finding["name"] and (finding["host"] or nvt_oid):
                 findings.append(finding)
 
         except Exception:
             continue
 
-    findings.sort(key=lambda x: float(x.get("severity", 0.0)), reverse=True)
+    findings.sort(key=lambda x: float(x.get("cvss", 0.0)), reverse=True)
     return findings[: max(0, int(top_n))]
 
 
@@ -461,6 +514,7 @@ def emit_payload(
     output_mode: str,
     url: str,
     api_key: str,
+    company_id: int,
     payload: dict[str, Any],
     timeout: int = 15,
     require_https: bool = True
@@ -487,9 +541,20 @@ def emit_payload(
         if require_https and not url.startswith("https://"):
             raise ValueError("Backend URL debe ser HTTPS (o usa OUTPUT_MODE=console)")
 
+        # ✅ Backend exige companyId y apiKey como campos del body
+        if isinstance(payload, dict):
+            payload = dict(payload)  # copia para no mutar original
+            if api_key:
+                payload["apiKey"] = api_key
+            if company_id:
+                payload["companyId"] = company_id
+
         headers = {"Content-Type": "application/json"}
+
+        # Fallbacks: por si backend también acepta header
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+            headers["X-API-Key"] = api_key
 
         if not tls_verify:
             try:
